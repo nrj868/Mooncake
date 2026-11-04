@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -18,6 +19,8 @@
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
+#include "storage/external/external_store_backend.h"
+#include "storage/external/external_store_task.h"
 #include "thread_pool.h"
 #include "transfer_engine.h"
 #include "transfer_task.h"
@@ -72,6 +75,28 @@ class QueryResult {
 class Client {
    public:
     virtual ~Client();
+
+    // Install the external backend before registering load targets.
+    tl::expected<void, ErrorCode> SetExternalStoreBackend(
+        std::shared_ptr<ExternalStoreBackend> backend,
+        const std::unordered_map<std::string, std::string>& options);
+
+    bool ShouldUseExternal(
+        const tl::expected<QueryResult, ErrorCode>& query) const;
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistsExternal(
+        const std::vector<ObjectKey>& keys);
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchGetExternalAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& targets,
+        std::vector<size_t>* actual_sizes);
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchGetExternalRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& targets,
+        const std::vector<std::vector<size_t>>& source_offsets,
+        std::vector<size_t>* actual_sizes);
+    std::vector<tl::expected<int64_t, ErrorCode>> CompleteExternalRead(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        const std::vector<size_t>& actual_sizes, size_t key_count);
 
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
@@ -820,6 +845,9 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    tl::expected<void, ErrorCode> InitExternalStoreBackendFromEnvironment();
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchExistsExternalAsync(
+        const std::vector<ObjectKey>& keys, std::vector<uint8_t>* exists);
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -1011,6 +1039,7 @@ class Client {
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+    std::shared_ptr<ExternalStoreBackend> external_store_backend_;
 
     // Probe used by healDanglingLocalDiskReplica to prove a completed
     // LOCAL_DISK replica's backing file is gone. Installed by the owner of
