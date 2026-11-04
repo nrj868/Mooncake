@@ -3084,19 +3084,16 @@ int RealClient::isExist(const std::string &key) {
 }
 
 int RealClient::isExist(const std::string &key, const ExistOptions &options) {
-    auto result = isExist_internal(key);
-
-    if (result.has_value()) {
+    if (options.prefetch_to_memory && enable_ssd_prefetch_ && prefetcher_ &&
+        client_) {
+        bool master_hit;
+        auto result = client_->IsExist(key, master_hit);
         // Best-effort SSD prefetch: synchronous part is a throttle dedup plus
         // a pool enqueue; no RPC is added to the exist path.
-        if (options.prefetch_to_memory && *result && enable_ssd_prefetch_ &&
-            prefetcher_) {
-            prefetcher_->TriggerPrefetch({key});
-        }
-        return *result ? 1 : 0;  // 1 if exists, 0 if not
-    } else {
-        return toInt(result.error());
+        if (master_hit) prefetcher_->TriggerPrefetch({key});
+        return to_py_ret(result);
     }
+    return to_py_ret(isExist_internal(key));
 }
 
 std::vector<int> RealClient::batchIsExist(
@@ -3106,30 +3103,16 @@ std::vector<int> RealClient::batchIsExist(
 
 std::vector<int> RealClient::batchIsExist(const std::vector<std::string> &keys,
                                           const ExistOptions &options) {
-    auto internal_results = batchIsExist_internal(keys);
-    std::vector<int> results;
-    results.reserve(internal_results.size());
-
-    const bool maybe_prefetch =
-        options.prefetch_to_memory && enable_ssd_prefetch_ && prefetcher_;
-    std::vector<std::string> prefetch_candidates;
-    for (size_t i = 0; i < internal_results.size(); ++i) {
-        const auto &result = internal_results[i];
-        if (result.has_value()) {
-            results.push_back(result.value() ? 1 : 0);  // 1 if exists, 0 if not
-            if (maybe_prefetch && result.value()) {
-                prefetch_candidates.push_back(keys[i]);
-            }
-        } else {
-            results.push_back(toInt(result.error()));
+    if (options.prefetch_to_memory && enable_ssd_prefetch_ && prefetcher_ &&
+        client_ && !keys.empty()) {
+        std::vector<ObjectKey> master_hits;
+        auto results = client_->BatchIsExist(keys, &master_hits);
+        if (!master_hits.empty()) {
+            prefetcher_->TriggerPrefetch(master_hits);
         }
+        return ToPyResults(results);
     }
-
-    if (!prefetch_candidates.empty()) {
-        prefetcher_->TriggerPrefetch(prefetch_candidates);
-    }
-
-    return results;
+    return ToPyResults(batchIsExist_internal(keys));
 }
 
 int RealClient::probeKey(const std::string &key) {
@@ -6763,6 +6746,8 @@ RealClient::batch_get_into_internal(
     std::vector<DiskKeyInfo> disk_operations;
     valid_operations.reserve(num_keys);
 
+    ExternalReadRequests external_requests;
+
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
         const auto &key = keys[i];
@@ -6770,6 +6755,13 @@ RealClient::batch_get_into_internal(
         // Handle query failures
         if (!query_results[i]) {
             const auto error = query_results[i].error();
+            if (client_->ShouldGetFromExternalStore(error)) {
+                external_requests.keys.push_back(key);
+                external_requests.targets.push_back(
+                    {Slice{buffers[i], sizes[i]}});
+                external_requests.result_indices.push_back(i);
+                continue;
+            }
             results[i] = tl::unexpected(error);
             if (error != ErrorCode::OBJECT_NOT_FOUND &&
                 error != ErrorCode::REPLICA_IS_NOT_READY) {
@@ -6874,8 +6866,15 @@ RealClient::batch_get_into_internal(
 
     // Early return if no valid operations
     if (valid_operations.empty() && valid_local_disk_operations.empty() &&
-        disk_operations.empty()) {
+        disk_operations.empty() && external_requests.keys.empty()) {
         return results;
+    }
+
+    // Submit external reads before running the existing load sequence.
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> external_read;
+    if (!external_requests.keys.empty()) {
+        external_read = client_->BatchGetExternalAsync(
+            external_requests.keys, external_requests.targets);
     }
 
     // Prepare batch transfer data structures
@@ -7088,6 +7087,10 @@ RealClient::batch_get_into_internal(
     //           << "us, with memory key count: " << valid_operations.size()
     //           << ", offload key count: " << offload_object_count;
 
+    if (!external_requests.keys.empty()) {
+        collect_external_read_results(
+            external_read, external_requests.result_indices, results);
+    }
     return results;
 }
 
@@ -7229,8 +7232,24 @@ std::vector<int> RealClient::batch_get_session_start(
     }
     auto local_endpoints = client_->GetLocalEndpoints();
 
+    const auto external_results =
+        check_external_get_candidates(keys, query_results);
+    auto external = external_results.begin();
     std::lock_guard<std::mutex> lock(session_mutex_);
     for (size_t i = 0; i < keys.size(); ++i) {
+        if (external != external_results.end() && external->first == i) {
+            const auto &exists = external->second;
+            get_sessions_.erase(keys[i]);
+            if (exists && *exists) {
+                get_sessions_.emplace(keys[i], ExternalReadSource{});
+                results[i] = 0;
+            } else {
+                results[i] = static_cast<int>(toInt(
+                    exists ? ErrorCode::OBJECT_NOT_FOUND : exists.error()));
+            }
+            ++external;
+            continue;
+        }
         if (!query_results[i]) {
             results[i] = static_cast<int>(toInt(query_results[i].error()));
             get_sessions_.erase(keys[i]);
@@ -7313,7 +7332,7 @@ RealClient::prepare_session_range_read_requests(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     const std::vector<std::vector<size_t>> &all_src_offsets,
-    std::vector<int> &results) {
+    std::vector<int> &results, ExternalReadRequests &external_requests) {
     std::vector<SessionRangeReadRequest> requests;
     requests.reserve(keys.size());
 
@@ -7331,21 +7350,30 @@ RealClient::prepare_session_range_read_requests(
 
         auto session = get_sessions_.find(keys[request_index]);
         if (session == get_sessions_.end()) continue;
-        if (session->second.IsLeaseExpired(validation_time)) {
+        const auto *query = std::get_if<QueryResult>(&session->second);
+        if (!query) {
+            auto prepared = prepare_external_session_range_read_request(
+                keys[request_index], buffers, sizes, offsets, request_index,
+                external_requests);
+            results[request_index] =
+                prepared ? 0 : static_cast<int>(toInt(prepared.error()));
+            continue;
+        }
+        const auto &query_result = *query;
+        if (query_result.IsLeaseExpired(validation_time)) {
             get_sessions_.erase(session);
             results[request_index] =
                 static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
             continue;
         }
-        if (session->second.replicas.empty() ||
-            (!StoreHcaAffinityEnabled() &&
-             session->second.replicas.size() != 1)) {
+        if (query_result.replicas.empty() ||
+            (!StoreHcaAffinityEnabled() && query_result.replicas.size() != 1)) {
             results[request_index] =
                 static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
             continue;
         }
 
-        const auto &replica = session->second.replicas.front();
+        const auto &replica = query_result.replicas.front();
         const uint64_t replica_size = calculate_total_size(replica);
         if (replica_size > std::numeric_limits<size_t>::max()) {
             results[request_index] =
@@ -7384,11 +7412,11 @@ RealClient::prepare_session_range_read_requests(
         }
 
         requests.push_back(SessionRangeReadRequest{
-            keys[request_index], request_index, replica, session->second,
+            keys[request_index], request_index, replica, query_result,
             std::vector<void *>(buffers.begin(), buffers.end()),
             std::vector<size_t>(sizes.begin(), sizes.end()),
             std::vector<size_t>(offsets.begin(), offsets.end()),
-            transferred_bytes, session->second.lease_timeout});
+            transferred_bytes, query_result.lease_timeout});
     }
     return requests;
 }
@@ -7982,16 +8010,32 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         return results;
     }
 
+    ExternalReadRequests external_requests;
     auto requests = prepare_session_range_read_requests(
-        keys, all_buffers, all_sizes, all_src_offsets, results);
+        keys, all_buffers, all_sizes, all_src_offsets, results,
+        external_requests);
     auto read_plan =
         classify_session_range_read_requests(std::move(requests), results);
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> external_read;
+    if (!external_requests.keys.empty()) {
+        external_read = client_->BatchGetExternalRangesAsync(
+            external_requests.keys, external_requests.targets,
+            external_requests.source_offsets);
+    }
 
     execute_session_memory_range_reads(read_plan.memory_requests, results);
     execute_session_dfs_range_reads(read_plan.dfs_requests, results);
     execute_session_local_disk_range_reads(read_plan.local_disk_requests,
                                            results);
     execute_session_disk_range_reads(read_plan.disk_requests, results);
+    if (!external_requests.keys.empty()) {
+        auto loaded = client_->CompleteExternalRead(
+            external_read, external_requests.keys.size());
+        for (size_t i = 0; i < loaded.size(); ++i) {
+            results[external_requests.result_indices[i]] =
+                static_cast<int>(to_py_ret(loaded[i]));
+        }
+    }
     return results;
 }
 
@@ -8578,6 +8622,7 @@ RealClient::batch_get_into_multi_buffers_internal(
     std::unordered_map<std::string, DiskKeyInfo> valid_local_disk_ops;
     std::vector<DuplicateDiskOp> duplicate_disk_ops;
     valid_operations.reserve(num_keys);
+    ExternalReadRequests external_requests;
     auto local_endpoints = client_->GetLocalEndpoints();
     KickPrefetchForDiskHeadedKeys(keys, query_results, local_endpoints);
     for (size_t i = 0; i < num_keys; ++i) {
@@ -8585,6 +8630,19 @@ RealClient::batch_get_into_multi_buffers_internal(
         // Handle query failures
         if (!query_results[i]) {
             const auto error = query_results[i].error();
+            if (client_->ShouldGetFromExternalStore(error)) {
+                if (all_buffers[i].size() != all_sizes[i].size()) {
+                    results.emplace_back(
+                        tl::unexpected(ErrorCode::INVALID_PARAMS));
+                    continue;
+                }
+                external_requests.keys.push_back(key);
+                external_requests.targets.push_back(
+                    SlicesFromBuffers(all_buffers[i], all_sizes[i]));
+                external_requests.result_indices.push_back(i);
+                results.emplace_back(int64_t{0});
+                continue;
+            }
             results.emplace_back(tl::unexpected(error));
             if (error != ErrorCode::OBJECT_NOT_FOUND) {
                 LOG(ERROR) << "Query failed for key '" << key
@@ -8676,9 +8734,18 @@ RealClient::batch_get_into_multi_buffers_internal(
         // Set success result (actual bytes transferred)
         results.emplace_back(static_cast<int64_t>(total_size));
     }
+
     // Early return if no valid operations
-    if (valid_operations.empty() && valid_local_disk_ops.empty()) {
+    if (valid_operations.empty() && valid_local_disk_ops.empty() &&
+        external_requests.keys.empty()) {
         return results;
+    }
+
+    // Submit external reads before running the existing load sequence.
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> external_read;
+    if (!external_requests.keys.empty()) {
+        external_read = client_->BatchGetExternalAsync(
+            external_requests.keys, external_requests.targets);
     }
 
     // ---- Memory/NOF replica: existing BatchGet path ----
@@ -8957,6 +9024,10 @@ RealClient::batch_get_into_multi_buffers_internal(
         }
     }
 
+    if (!external_requests.keys.empty()) {
+        collect_external_read_results(
+            external_read, external_requests.result_indices, results);
+    }
     return results;
 }
 
