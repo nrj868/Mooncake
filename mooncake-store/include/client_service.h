@@ -97,7 +97,6 @@ class Client {
     std::vector<tl::expected<int64_t, ErrorCode>> CompleteExternalRead(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         const std::vector<size_t>& actual_sizes, size_t key_count);
-
     tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalAsync(
         const std::vector<ObjectKey>& keys,
         const std::vector<std::vector<Slice>>& sources);
@@ -115,7 +114,10 @@ class Client {
     void CompleteExternalPut(
         tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
         std::span<tl::expected<void, ErrorCode>> native_results);
-
+    void CompleteExternalRangePut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        const std::vector<std::vector<Slice>>& slices,
+        std::vector<tl::expected<int64_t, ErrorCode>>& transfer);
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
             const std::vector<Slice>&)>;

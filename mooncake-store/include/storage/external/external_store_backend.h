@@ -39,7 +39,6 @@ class ExternalStoreBackend {
     // Remove the external object independently of native replica leases.
     virtual tl::expected<TaskHandle, ErrorCode> BatchRemoveAsync(
         const std::vector<ObjectKey>& keys, const TenantId& tenant_id) = 0;
-
     // exists is non-null and stays valid until Wait returns.
     // Successful query items report 0 (missing) or 1 (present).
     virtual tl::expected<TaskHandle, ErrorCode> BatchExistsAsync(
