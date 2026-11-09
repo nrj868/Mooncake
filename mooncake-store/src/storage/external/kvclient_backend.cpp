@@ -518,7 +518,7 @@ KvClientBackend::BatchPutAsync(
         });
     }
     kv::TaskId task = kv::kInvalidTaskId;
-    auto submitted = kv_client_->BatchStoreAsync(entries, task);
+    auto submitted = kv_client_->StoreAsync(entries, task);
     if (!submitted.ok()) {
         LOG(WARNING) << "Failed to submit KVClient store, entries="
                      << entries.size()
@@ -555,7 +555,7 @@ KvClientBackend::BatchPutRangesAsync(
         });
     }
     kv::TaskId task = kv::kInvalidTaskId;
-    auto submitted = kv_client_->BatchStoreAsync(entries, task);
+    auto submitted = kv_client_->StoreAsync(entries, task);
     if (!submitted.ok()) {
         LOG(WARNING) << "Failed to submit KVClient store, entries="
                      << entries.size()
