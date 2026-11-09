@@ -112,6 +112,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha_metric_manager.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
+    client_external_store.cpp
+    storage/external/external_store_task.cpp
     storage/external/external_store_backend_factory.cpp
     common/client_buffer_allocation.cpp
     mmap_arena.cpp

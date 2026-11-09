@@ -19,6 +19,7 @@
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
+#include "storage/external/external_store_task.h"
 #include "thread_pool.h"
 #include "transfer_engine.h"
 #include "transfer_task.h"
@@ -79,6 +80,10 @@ class Client {
    public:
     virtual ~Client();
 
+    tl::expected<void, ErrorCode> SetExternalStoreBackend(
+        std::shared_ptr<ExternalStoreBackend> backend,
+        const std::unordered_map<std::string, std::string>& options);
+
     // One topology/registration snapshot serves every key or fragment in a
     // batch. Returned names remain owned by that snapshot.
     using HcaAffinity =
@@ -107,6 +112,64 @@ class Client {
     ReadReplicaSelector MakeReadReplicaSelector() const {
         return ReadReplicaSelector(this);
     }
+
+    /**
+     * @brief Submits batch writes to external storage
+     * @param keys Object keys
+     * @param sources Data slices indexed to match keys, in object byte order.
+     * Source buffers must remain valid and unchanged until the task completes.
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources);
+
+    /**
+     * @brief Submits batch range writes to external storage
+     * @param keys Object keys
+     * @param sources Data slices indexed to match keys. Source buffers must
+     * remain valid and unchanged until the task completes.
+     * @param destination_offsets Byte offsets relative to each logical key,
+     * indexed to match sources
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources,
+        const std::vector<std::vector<size_t>>& destination_offsets);
+
+    /**
+     * @brief Submits external deletes independently of native replica leases
+     * @param keys Object keys to remove
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchRemoveExternalAsync(
+        const std::vector<ObjectKey>& keys);
+
+    /**
+     * @brief Helper methods for completing external storage operations
+     *
+     * Accepted tasks are waited and consumed; empty guards leave native
+     * results unchanged. Put succeeds per key if either storage path succeeds;
+     * otherwise the native error is preserved. Range writes retain native byte
+     * counts, or report the sum of slice sizes when only external IO succeeds.
+     * Remove logs external failures without changing native deletion results.
+     */
+    void CompleteExternalRemove(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission);
+    tl::expected<void, ErrorCode> CompleteExternalPut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        tl::expected<void, ErrorCode> native_result = {});
+    void CompleteExternalPut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        std::span<tl::expected<void, ErrorCode>> native_results);
+    void CompleteExternalRangePut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        const std::vector<std::vector<Slice>>& slices,
+        std::vector<tl::expected<int64_t, ErrorCode>>& transfer);
 
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
@@ -1016,6 +1079,7 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
     void InitTransferSubmitter();
+    tl::expected<void, ErrorCode> InitExternalStoreBackendFromEnvironment();
     ErrorCode TransferData(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, TransferRequest::OpCode op_code,
@@ -1188,6 +1252,7 @@ class Client {
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+    std::shared_ptr<ExternalStoreBackend> external_store_backend_;
 
     // Probe used by healDanglingLocalDiskReplica to prove a completed
     // LOCAL_DISK replica's backing file is gone. Installed by the owner of

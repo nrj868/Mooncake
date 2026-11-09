@@ -492,6 +492,13 @@ Client::Client(const std::string& local_hostname,
 }
 
 Client::~Client() {
+    if (external_store_backend_) {
+        auto result = external_store_backend_->Shutdown();
+        if (!result) {
+            LOG(ERROR) << "Failed to shut down external store backend: "
+                       << toString(result.error());
+        }
+    }
     task_poll_running_ = false;
     if (task_poll_thread_.joinable()) {
         task_poll_thread_.join();
@@ -1306,6 +1313,9 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     client->InitTransferSubmitter();
+    if (!client->InitExternalStoreBackendFromEnvironment()) {
+        return std::nullopt;
+    }
     // Initialize local hot cache
     err = client->InitLocalHotCache();
     if (err != ErrorCode::OK) {
@@ -2070,12 +2080,14 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    auto external = BatchPutExternalAsync({key}, {slices});
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
-            return tl::unexpected(checksum_result.error());
+            return CompleteExternalPut(external,
+                                       tl::unexpected(checksum_result.error()));
         }
         object_checksum = *checksum_result;
     }
@@ -2107,7 +2119,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
             VLOG(1) << "object_already_exists key=" << key;
-            return {};
+            return CompleteExternalPut(external);
         }
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
             LOG(WARNING) << "Failed to start put operation for key=" << key
@@ -2116,7 +2128,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             LOG(ERROR) << "Failed to start put operation for key=" << key
                        << ": " << toString(err);
         }
-        return tl::unexpected(err);
+        return CompleteExternalPut(external, tl::unexpected(err));
     }
 
     ReplicaTransferSummary transfer_summary;
@@ -2206,7 +2218,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
-            return tl::unexpected(err);
+            return CompleteExternalPut(external, tl::unexpected(err));
         }
     }
 
@@ -2215,15 +2227,17 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             master_client_.PutRevoke(key, *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
-            return tl::unexpected(revoke_result.error());
+            return CompleteExternalPut(external,
+                                       tl::unexpected(revoke_result.error()));
         }
     }
 
     if (!finalize_decision.success) {
-        return tl::unexpected(finalize_decision.error);
+        return CompleteExternalPut(external,
+                                   tl::unexpected(finalize_decision.error));
     }
 
-    return {};
+    return CompleteExternalPut(external);
 }
 
 namespace {
@@ -3683,6 +3697,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
+    auto external = BatchPutExternalAsync(keys, batched_slices);
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3691,8 +3706,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
-            return std::vector<tl::expected<void, ErrorCode>>(
+            auto native_results = std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(*err));
+            CompleteExternalPut(external, std::span(native_results));
+            return native_results;
         }
     }
     StartBatchPut(ops, client_cfg);
@@ -3711,7 +3728,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     }
 
     FinalizeBatchPut(ops);
-    return CollectResults(ops);
+    auto native_results = CollectResults(ops);
+    CompleteExternalPut(external, std::span(native_results));
+    return native_results;
 }
 
 // Defined after PutOperation: std::vector<PutOperation> must be instantiated
@@ -3820,10 +3839,12 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
         return std::move(results.front());
     }
 
+    auto external = BatchRemoveExternalAsync({key});
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
     }
     auto result = master_client_.Remove(key, force);
+    CompleteExternalRemove(external);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
     // }
@@ -3878,11 +3899,13 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
 
 std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
     const std::vector<ObjectKey>& keys, bool force) {
+    auto external = BatchRemoveExternalAsync(keys);
     if (hot_cache_) {
         hot_cache_->BumpKeyGenerations(keys);
     }
 
     auto results = master_client_.BatchRemove(keys, force);
+    CompleteExternalRemove(external);
 
     const size_t result_count = std::min(keys.size(), results.size());
     std::vector<std::string> removed_keys;
@@ -4218,11 +4241,27 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (external_store_backend_) {
+        auto registered =
+            external_store_backend_->RegisterMemory(addr, length, location);
+        if (!registered) {
+            auto rollback =
+                transfer_engine_->unregisterLocalMemory(addr, update_metadata);
+            if (rollback != 0) {
+                LOG(ERROR) << "TE registration rollback failed: " << rollback;
+            }
+            return tl::unexpected(registered.error());
+        }
+    }
     return {};
 }
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
+    tl::expected<void, ErrorCode> external_result;
+    if (external_store_backend_) {
+        external_result = external_store_backend_->UnregisterMemory(addr);
+    }
     const int rc =
         transfer_engine_->unregisterLocalMemory(addr, update_metadata);
     if (rc != 0) {
@@ -4233,7 +4272,7 @@ tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
                                   ? ErrorCode::NOT_REGISTERED
                                   : ErrorCode::INVALID_PARAMS);
     }
-    return {};
+    return external_result;
 }
 
 tl::expected<bool, ErrorCode> Client::IsExist(const std::string& key) {
