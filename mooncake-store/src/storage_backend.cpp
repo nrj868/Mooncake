@@ -74,6 +74,9 @@ std::string ErrnoSuffix(int err) {
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
+#ifdef MOONCAKE_HAVE_KVCLIENT_SDK
+#include "storage/distributed/kvclient/kvclient_backend.h"
+#endif
 
 namespace mooncake {
 
@@ -6524,6 +6527,17 @@ CreateStorageBackend(const FileStorageConfig& config) {
                 object_storage_adapter =
                     std::make_unique<KvcsObjectStorageAdapter>(
                         distributed_config.object_storage_config_path);
+            } else if (distributed_config.UsesKvClient()) {
+#ifdef MOONCAKE_HAVE_KVCLIENT_SDK
+                auto adapter = CreateKvClientObjectStorageAdapter();
+                if (!adapter)
+                    return tl::make_unexpected(adapter.error());
+                object_storage_adapter = std::move(*adapter);
+#else
+                LOG(ERROR) << "KVClient SDK not built in; kvclient backend "
+                              "unavailable";
+                return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+#endif
             } else {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "config/distributed_storage_config.h"
+#include "storage_backend.h"
 
 namespace mooncake {
 
@@ -79,6 +80,8 @@ void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(5));
     EXPECT_TRUE(config.object_storage_config_path.empty());
     EXPECT_FALSE(config.UsesKvcs());
+    EXPECT_FALSE(config.UsesKvClient());
+    EXPECT_FALSE(config.UsesObjectStorage());
 }
 
 DistributedStorageConfig ValidConfig() {
@@ -188,6 +191,34 @@ TEST_F(DistributedStorageConfigTest, ExplicitKvcsAdapterSelectsLowLevel) {
     EXPECT_FALSE(config.enable_health_check);
 }
 
+TEST_F(DistributedStorageConfigTest,
+       ExplicitKvClientAdapterSelectsObjectStorage) {
+    env.fs_adapter.Set("kvclient");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_EQ(config.fs_adapter_type, "kvclient");
+    EXPECT_TRUE(config.UsesObjectStorage());
+    EXPECT_TRUE(config.UsesKvClient());
+    EXPECT_FALSE(config.UsesKvcs());
+    EXPECT_TRUE(config.Validate());
+}
+
+#ifdef MOONCAKE_KVCLIENT_TEST_NO_SDK
+TEST_F(DistributedStorageConfigTest,
+       KvClientFactoryReturnsNotSupportedWithoutSdk) {
+    env.fs_adapter.Set("kvclient");
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+
+    const auto backend = CreateStorageBackend(file_config);
+
+    ASSERT_FALSE(backend);
+    EXPECT_EQ(backend.error(), ErrorCode::NOT_SUPPORTED);
+}
+#endif
+
 TEST_F(DistributedStorageConfigTest, EmptyPreferredRootOverridesAlias) {
     env.legacy_root_dir.Set("/tmp/legacy-dfs");
     env.root_dir.Set("");
@@ -273,6 +304,34 @@ TEST(DistributedStorageConfigValidationTest, KvcsUsesDfsEvictionSettings) {
     config.eviction_enabled = false;
     config.eviction_check_interval = std::chrono::seconds(0);
     EXPECT_FALSE(config.Validate());
+}
+
+TEST(DistributedStorageConfigValidationTest, KvClientRejectsMultiTenant) {
+    DistributedStorageConfig config;
+    config.fs_adapter_type = "kvclient";
+    config.single_tenant = false;
+    EXPECT_FALSE(config.Validate());
+}
+
+TEST(DistributedStorageConfigValidationTest,
+     KvClientSkipsFilesystemRootChecks) {
+    DistributedStorageConfig config;
+    config.fs_adapter_type = "kvclient";
+
+    config.fsdir.clear();
+    EXPECT_TRUE(config.Validate());
+
+    config.fsdir = "relative/path";
+    EXPECT_TRUE(config.Validate());
+}
+
+TEST(DistributedStorageConfigValidationTest,
+     KvClientIsNotAValidAllocatorBackend) {
+    DistributedStorageConfig config;
+    config.fs_adapter_type = "kvclient";
+
+    EXPECT_TRUE(config.Validate());
+    EXPECT_FALSE(config.ValidateForAllocator());
 }
 
 TEST(DistributedStorageConfigValidationTest, RejectsInvalidBaseSettings) {

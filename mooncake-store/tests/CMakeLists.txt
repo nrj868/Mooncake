@@ -385,6 +385,10 @@ add_store_test(dfs_immutable_bucket_client_test
                dfs_immutable_bucket_client_test.cpp)
 add_store_test(distributed_storage_config_test
                distributed_storage_config_test.cpp)
+if(NOT MOONCAKE_KVCLIENT_SDK_FOUND)
+  target_compile_definitions(distributed_storage_config_test
+                             PRIVATE MOONCAKE_KVCLIENT_TEST_NO_SDK=1)
+endif()
 add_store_test(dfs_sync_client_test dfs_sync_client_test.cpp)
 add_test(
   NAME dfs_read_checksum_test

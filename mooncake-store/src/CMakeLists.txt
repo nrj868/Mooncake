@@ -216,6 +216,24 @@ set(MOONCAKE_KVCS_SDK_FOUND
     ${MOONCAKE_KVCS_SDK_FOUND}
     PARENT_SCOPE)
 
+# KVClient is optional. Without the SDK the adapter TU is not compiled and the
+# factory branch in storage_backend.cpp returns NOT_SUPPORTED.
+set(MOONCAKE_KVCLIENT_SDK_FOUND OFF)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+  # GLOBAL keeps the imported target visible to the sibling tests/ directory.
+  pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET GLOBAL "kvclient>=0.1.0")
+endif()
+if(TARGET PkgConfig::KVCLIENT)
+  set(MOONCAKE_KVCLIENT_SDK_FOUND ON)
+  message(STATUS "KVClient SDK found: kvclient backend enabled")
+else()
+  message(STATUS "KVClient SDK not found: kvclient backend disabled")
+endif()
+set(MOONCAKE_KVCLIENT_SDK_FOUND
+    ${MOONCAKE_KVCLIENT_SDK_FOUND}
+    PARENT_SCOPE)
+
 # RISC-V toolchains may implement 16-byte atomic operations in libatomic rather
 # than emitting native instructions. Boost.Lockfree uses these operations in the
 # Store master, so detect and propagate the runtime library in RISC-V mode.
@@ -641,6 +659,14 @@ if(STORE_USE_K8S_LEASE)
   add_dependencies(mooncake_store_master_objects build_k8s_lease_wrapper)
 endif()
 
+# The adapter TU includes the KVClient SDK; only compile it when the SDK is
+# present. Keep it out of MOONCAKE_STORE_SHARED_SOURCES: that object library
+# also feeds mooncake_store_master, which must stay vendor-free.
+if(MOONCAKE_KVCLIENT_SDK_FOUND)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES
+       storage/distributed/kvclient/kvclient_object_storage_adapter.cpp)
+endif()
+
 # Sources used only by Store clients and the complete mooncake_store library.
 add_library(mooncake_store_client_objects OBJECT
             ${MOONCAKE_STORE_CLIENT_SOURCES})
@@ -663,6 +689,14 @@ target_link_libraries(
           $<$<PLATFORM_ID:Linux>:numa>
           asio_shared
           yalantinglibs::yalantinglibs)
+if(MOONCAKE_KVCLIENT_SDK_FOUND)
+  # storage_backend.cpp and the adapter TU are both compiled into this object
+  # library, so the define must live here rather than on shared objects.
+  target_compile_definitions(mooncake_store_client_objects
+                             PRIVATE MOONCAKE_HAVE_KVCLIENT_SDK=1)
+  target_link_libraries(mooncake_store_client_objects
+                        PRIVATE PkgConfig::KVCLIENT)
+endif()
 if(BUILD_UNIT_TESTS)
   target_compile_definitions(mooncake_store_client_objects
                              PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
@@ -775,6 +809,10 @@ if(USE_NOF)
 endif()
 if(MOONCAKE_KVCS_SDK_FOUND)
   target_link_libraries(mooncake_store PRIVATE PkgConfig::KVCS)
+endif()
+if(MOONCAKE_KVCLIENT_SDK_FOUND)
+  # OBJECT-library PRIVATE links do not propagate to the final link.
+  target_link_libraries(mooncake_store PRIVATE PkgConfig::KVCLIENT)
 endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)
