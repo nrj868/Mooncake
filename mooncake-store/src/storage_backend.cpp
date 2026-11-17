@@ -75,7 +75,7 @@ std::string ErrnoSuffix(int err) {
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
 #ifdef MOONCAKE_HAVE_KVCLIENT_SDK
-#include "storage/distributed/kvclient/kvclient_backend.h"
+#include "storage/distributed/kvclient/kvclient_adapter_factory.h"
 #endif
 
 namespace mooncake {

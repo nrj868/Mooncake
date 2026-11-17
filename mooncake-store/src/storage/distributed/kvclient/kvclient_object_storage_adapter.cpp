@@ -11,7 +11,7 @@
 #include <glog/logging.h>
 #include <xxhash.h>
 
-#include "storage/distributed/kvclient/kvclient_backend.h"
+#include "storage/distributed/kvclient/kvclient_adapter_factory.h"
 
 namespace mooncake {
 namespace {
