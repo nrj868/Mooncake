@@ -224,7 +224,9 @@ set(MOONCAKE_KVCLIENT_SDK_FOUND OFF)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
   # GLOBAL keeps the imported target visible to the sibling tests/ directory.
-  pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET GLOBAL "kvclient>=0.1.0")
+  # No version floor: the SDK does not publish kvclient.pc yet, so there is no
+  # defined kvclient package version to compare against.
+  pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET GLOBAL "kvclient")
 endif()
 if(TARGET PkgConfig::KVCLIENT)
   set(MOONCAKE_KVCLIENT_SDK_FOUND ON)
