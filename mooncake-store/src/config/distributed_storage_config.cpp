@@ -77,10 +77,11 @@ bool DistributedStorageConfig::Validate() const {
     }
     if (UsesKvClient()) {
         if (!single_tenant) {
-            // The synchronous DFS write path (BatchWrite -> ObjectPutRequest)
-            // passes the raw object key, not the tenant-scoped storage key.
-            // The SDK's IoOptions.kvns is not consumed in this version, so two
-            // tenants sharing a key would collide in the KV namespace.
+            // Client::Put/BatchPut -> WriteDfsReplicas -> DfsWriteRequest ->
+            // ObjectPutRequest passes the raw user key; only the offload/read
+            // RPC paths use TenantId::MakeScopedKey. The SDK's IoOptions.kvns
+            // is not consumed in this version, so two tenants sharing a key
+            // would collide in the KV namespace.
             LOG(ERROR) << "DistributedStorageConfig: KVClient requires "
                           "single_tenant=true";
             return false;
