@@ -19,6 +19,8 @@
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
+#include "storage/external/external_store_backend.h"
+#include "storage/external/external_store_task.h"
 #include "thread_pool.h"
 #include "transfer_engine.h"
 #include "transfer_task.h"
@@ -295,6 +297,122 @@ class Client {
         std::unordered_map<std::string, std::vector<Slice>>& slices,
         bool group_by_target = false);
 
+    /** @brief Returns whether this client has an external store backend. */
+    bool HasExternalStoreBackend() const {
+        return external_store_backend_ != nullptr;
+    }
+
+    /**
+     * @brief Checks whether a failed Master query can use external storage.
+     * @param query_error Error returned by the Master query.
+     * @return True when a backend is configured and the object is missing or
+     * its replicas are not ready.
+     */
+    bool ShouldGetFromExternalStore(ErrorCode query_error) const;
+
+    /**
+     * @brief Queries external object existence synchronously. No Master RPC.
+     * @param keys Object keys to query.
+     * @return One existence result or ErrorCode per key, in input order.
+     */
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistsExternal(
+        const std::vector<ObjectKey>& keys);
+
+    /**
+     * @brief Submits complete-object reads to the external backend. No Master
+     * RPC. The Client and target memory must remain valid until the task is
+     * consumed. CompleteExternalRead reports bytes read for successful keys.
+     * @param keys Object keys to read.
+     * @param targets Destination slices per key; sizes are writable capacities.
+     * @return Task guard on acceptance, or ErrorCode if submission fails.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchGetExternalAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& targets);
+
+    /**
+     * @brief Submits exact byte-range reads to the external backend. No Master
+     * RPC. Client and target lifetimes follow BatchGetExternalAsync.
+     * @param keys Object keys to read.
+     * @param targets Destination slices per key; sizes are exact read lengths.
+     * @param source_offsets Object-byte offsets matching each target slice.
+     * @return Task guard on acceptance, or ErrorCode if submission fails.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchGetExternalRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& targets,
+        const std::vector<std::vector<size_t>>& source_offsets);
+
+    /**
+     * @brief Waits for external reads and converts completion results to bytes
+     * read or errors. Consumes an accepted task; performs no source selection.
+     * @param submission Accepted task guard or submission error.
+     * @param key_count Number of submitted keys, used to expand submission
+     * errors.
+     * @return One byte count or ErrorCode per key, in input order.
+     */
+    std::vector<tl::expected<int64_t, ErrorCode>> CompleteExternalRead(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        size_t key_count);
+
+    /**
+     * @brief Submits batch writes to external storage
+     * @param keys Object keys
+     * @param sources Data slices indexed to match keys, in object byte order.
+     * Source buffers must remain valid and unchanged until the task completes.
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources);
+
+    /**
+     * @brief Submits batch range writes to external storage
+     * @param keys Object keys
+     * @param sources Data slices indexed to match keys. Source buffers must
+     * remain valid and unchanged until the task completes.
+     * @param destination_offsets Byte offsets relative to each logical key,
+     * indexed to match sources
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchPutExternalRangesAsync(
+        const std::vector<ObjectKey>& keys,
+        const std::vector<std::vector<Slice>>& sources,
+        const std::vector<std::vector<size_t>>& destination_offsets);
+
+    /**
+     * @brief Submits external deletes independently of native replica leases
+     * @param keys Object keys to remove
+     * @return Task guard on submission success, or ErrorCode on failure.
+     * Returns an empty guard if keys is empty or no backend is configured.
+     */
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchRemoveExternalAsync(
+        const std::vector<ObjectKey>& keys);
+
+    /**
+     * @brief Helper methods for completing external storage operations
+     *
+     * Accepted tasks are waited and consumed; empty guards leave native
+     * results unchanged. Put succeeds per key if either storage path succeeds;
+     * otherwise the native error is preserved. Range writes retain native byte
+     * counts and errors so callers can decide whether to end or revoke a
+     * session. Remove logs external failures without changing native deletion
+     * results.
+     */
+    void CompleteExternalRemove(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission);
+    tl::expected<void, ErrorCode> CompleteExternalPut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        tl::expected<void, ErrorCode> native_result = {});
+    void CompleteExternalPut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        std::span<tl::expected<void, ErrorCode>> native_results);
+    void CompleteExternalRangePut(
+        tl::expected<ExternalStoreTaskGuard, ErrorCode>& submission,
+        const std::vector<ObjectKey>& keys);
+
     /**
      * @brief Stores data with replication
      * @param key Object key
@@ -530,6 +648,9 @@ class Client {
      * exists, other ErrorCode for errors
      */
     tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+    // Also reports whether the Master confirmed this key exists.
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key,
+                                          bool& master_hit);
 
     /**
      * @brief Point-in-time existence check that grants no read lease.
@@ -547,6 +668,10 @@ class Client {
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
+    // When requested, returns Master hits in input order for SSD prefetch.
+    std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
+        const std::vector<std::string>& keys,
+        std::vector<ObjectKey>* master_hits);
 
     WeightRpcResult<WeightRevisionMetadata> BeginWeightImport(
         const BeginWeightImportRequest& request);
@@ -994,6 +1119,9 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    tl::expected<void, ErrorCode> InitExternalStoreBackendFromEnvironment();
+    tl::expected<ExternalStoreTaskGuard, ErrorCode> BatchExistsExternalAsync(
+        const std::vector<ObjectKey>& keys);
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -1188,6 +1316,7 @@ class Client {
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+    std::shared_ptr<ExternalStoreBackend> external_store_backend_;
 
     // Probe used by healDanglingLocalDiskReplica to prove a completed
     // LOCAL_DISK replica's backing file is gone. Installed by the owner of
