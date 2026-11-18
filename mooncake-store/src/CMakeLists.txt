@@ -218,21 +218,87 @@ set(MOONCAKE_KVCS_SDK_FOUND
     ${MOONCAKE_KVCS_SDK_FOUND}
     PARENT_SCOPE)
 
-# KVClient is optional. Without the SDK the adapter TU is not compiled and the
-# factory branch in storage_backend.cpp returns NOT_SUPPORTED.
+# KVClient is optional, but the SDK does not publish kvclient.pc. Detect it
+# from pkg-config when a future package provides one, otherwise from an
+# explicit SDK root or include/library hints. Set
+# MOONCAKE_KVCLIENT_REQUIRED=ON to turn a missing SDK into a configure error
+# instead of silently skipping the adapter and hiding compile errors.
 set(MOONCAKE_KVCLIENT_SDK_FOUND OFF)
+# The SDK currently installs libraries but not headers; point this at the SDK
+# source tree, or set MOONCAKE_KVCLIENT_INCLUDE_DIR explicitly.
+set(MOONCAKE_KVCLIENT_SDK_ROOT "" CACHE PATH
+    "KVClient SDK source tree or install prefix")
+option(MOONCAKE_KVCLIENT_REQUIRED
+       "Fail configuration when the KVClient SDK is not found" OFF)
+
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
-  # GLOBAL keeps the imported target visible to the sibling tests/ directory.
-  # No version floor: the SDK does not publish kvclient.pc yet, so there is no
-  # defined kvclient package version to compare against.
   pkg_check_modules(KVCLIENT QUIET IMPORTED_TARGET GLOBAL "kvclient")
 endif()
+
 if(TARGET PkgConfig::KVCLIENT)
+  add_library(Mooncake::kvclient INTERFACE IMPORTED GLOBAL)
+  set_target_properties(Mooncake::kvclient PROPERTIES
+                        INTERFACE_LINK_LIBRARIES PkgConfig::KVCLIENT)
   set(MOONCAKE_KVCLIENT_SDK_FOUND ON)
-  message(STATUS "KVClient SDK found: kvclient backend enabled")
+  message(STATUS "KVClient SDK found via pkg-config: kvclient backend enabled")
 else()
-  message(STATUS "KVClient SDK not found: kvclient backend disabled")
+  set(_kvclient_hints)
+  if(MOONCAKE_KVCLIENT_SDK_ROOT)
+    list(APPEND _kvclient_hints "${MOONCAKE_KVCLIENT_SDK_ROOT}")
+  endif()
+  if(DEFINED ENV{MOONCAKE_KVCLIENT_SDK_ROOT})
+    list(APPEND _kvclient_hints "$ENV{MOONCAKE_KVCLIENT_SDK_ROOT}")
+  endif()
+  find_path(MOONCAKE_KVCLIENT_INCLUDE_DIR
+            NAMES kv_client.h
+            HINTS ${_kvclient_hints}
+            PATH_SUFFIXES include kv_semantics/include include/kv_semantics)
+  find_library(MOONCAKE_KVCLIENT_LIBRARY
+               NAMES kv_client
+               HINTS ${_kvclient_hints}
+               PATH_SUFFIXES lib lib64 kv_semantics/src ucm/store/asu src
+                             build/src build)
+  find_library(MOONCAKE_KVCLIENT_TRANSPORT_LIBRARY
+               NAMES kv_transport
+               HINTS ${_kvclient_hints}
+               PATH_SUFFIXES lib lib64 kv_semantics/src ucm/store/asu src
+                             build/src build)
+  if(MOONCAKE_KVCLIENT_INCLUDE_DIR AND MOONCAKE_KVCLIENT_LIBRARY)
+    add_library(Mooncake::kvclient UNKNOWN IMPORTED GLOBAL)
+    set(_kvclient_link_libraries "${MOONCAKE_KVCLIENT_LIBRARY}")
+    if(MOONCAKE_KVCLIENT_TRANSPORT_LIBRARY)
+      list(APPEND _kvclient_link_libraries
+           "${MOONCAKE_KVCLIENT_TRANSPORT_LIBRARY}")
+    endif()
+    set_target_properties(
+      Mooncake::kvclient
+      PROPERTIES IMPORTED_LOCATION "${MOONCAKE_KVCLIENT_LIBRARY}"
+                 INTERFACE_INCLUDE_DIRECTORIES
+                 "${MOONCAKE_KVCLIENT_INCLUDE_DIR}"
+                 INTERFACE_LINK_LIBRARIES "${_kvclient_link_libraries}")
+    set(MOONCAKE_KVCLIENT_SDK_FOUND ON)
+    message(
+      STATUS "KVClient SDK found: include=${MOONCAKE_KVCLIENT_INCLUDE_DIR}"
+             ", library=${MOONCAKE_KVCLIENT_LIBRARY}")
+  endif()
+endif()
+
+if(NOT MOONCAKE_KVCLIENT_SDK_FOUND)
+  if(MOONCAKE_KVCLIENT_REQUIRED OR MOONCAKE_KVCLIENT_SDK_ROOT)
+    message(
+      FATAL_ERROR
+        "KVClient SDK not found (MOONCAKE_KVCLIENT_REQUIRED=ON or "
+        "MOONCAKE_KVCLIENT_SDK_ROOT was set). Set MOONCAKE_KVCLIENT_SDK_ROOT "
+        "to a source tree or install prefix that contains kv_client.h and "
+        "libkv_client, or set MOONCAKE_KVCLIENT_INCLUDE_DIR and "
+        "MOONCAKE_KVCLIENT_LIBRARY.")
+  endif()
+  message(
+    STATUS
+      "KVClient SDK not found: adapter disabled. Set "
+      "MOONCAKE_KVCLIENT_SDK_ROOT or pass -DMOONCAKE_KVCLIENT_REQUIRED=ON "
+      "to make this fatal.")
 endif()
 set(MOONCAKE_KVCLIENT_SDK_FOUND
     ${MOONCAKE_KVCLIENT_SDK_FOUND}
@@ -699,7 +765,7 @@ if(MOONCAKE_KVCLIENT_SDK_FOUND)
   target_compile_definitions(mooncake_store_client_objects
                              PRIVATE MOONCAKE_HAVE_KVCLIENT_SDK=1)
   target_link_libraries(mooncake_store_client_objects
-                        PRIVATE PkgConfig::KVCLIENT)
+                        PRIVATE Mooncake::kvclient)
 endif()
 if(BUILD_UNIT_TESTS)
   target_compile_definitions(mooncake_store_client_objects
@@ -816,7 +882,7 @@ if(MOONCAKE_KVCS_SDK_FOUND)
 endif()
 if(MOONCAKE_KVCLIENT_SDK_FOUND)
   # OBJECT-library PRIVATE links do not propagate to the final link.
-  target_link_libraries(mooncake_store PRIVATE PkgConfig::KVCLIENT)
+  target_link_libraries(mooncake_store PRIVATE Mooncake::kvclient)
 endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)
