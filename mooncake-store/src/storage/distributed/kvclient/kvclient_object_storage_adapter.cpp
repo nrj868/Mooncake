@@ -62,12 +62,6 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
     if (!kv::KvClientConfig::LoadFromFile(config_.config_path, cfg).ok())
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     cfg.keyResolution = {};  // Force GENERIC.
-    if (cfg.timeoutMs < config_.wait_timeout_ms) {
-        LOG(ERROR) << "KVClient config timeoutMs=" << cfg.timeoutMs
-                   << " is shorter than wait_timeout_ms="
-                   << config_.wait_timeout_ms;
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
     // Init is not idempotent; the local client is only committed to the member
     // after this succeeds, so a retry starts from a fresh client.
     if (!client->Init(cfg).ok())
@@ -75,8 +69,7 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
 
     kv_client_ = std::move(client);
     initialized_ = true;
-    LOG(INFO) << "KVClient adapter initialized, max_object_bytes="
-              << config_.max_object_bytes;
+    LOG(INFO) << "KVClient adapter initialized";
     return {};
 }
 
@@ -128,14 +121,20 @@ KvClientObjectStorageAdapter::Completion
 KvClientObjectStorageAdapter::waitForCompletion(kv::TaskId task_id,
                                                 size_t entry_count) {
     kv::TaskResult result;
-    const auto wait_status =
-        kv_client_->Wait(task_id, config_.wait_timeout_ms, result);
+    // 0 lets the SDK use its configured defaultWaitTimeoutMs; the adapter does
+    // not impose a second timeout. The SDK reports TIMEOUT via the result.
+    const auto wait_status = kv_client_->Wait(task_id, 0, result);
     const auto code = wait_status.ok() ? result.status.code : wait_status.code;
     const kv::Status& task_status =
         wait_status.ok() ? result.status : wait_status;
 
     Completion completion;
     switch (code) {
+        case kv::StatusCode::OK:
+        case kv::StatusCode::PARTIAL_FAILED:
+            // Only these task statuses carry meaningful per-entry results.
+            completion.terminal = true;
+            break;
         case kv::StatusCode::TASK_NOT_FOUND:
             // Wait removes the task even after a timeout, so an unknown task
             // does not prove that its I/O has finished. Keep it non-terminal
@@ -157,10 +156,12 @@ KvClientObjectStorageAdapter::waitForCompletion(kv::TaskId task_id,
             completion.entryStatus.assign(entry_count, task_status);
             return completion;
         default:
-            // The task finished: OK/PARTIAL_FAILED and any task-level final
-            // error are terminal.
+            // A final task-level error. entryStatus may still hold submit-time
+            // OK values, so propagate the overall error to every entry instead
+            // of reading it.
             completion.terminal = true;
-            break;
+            completion.entryStatus.assign(entry_count, task_status);
+            return completion;
     }
 
     if (result.entryStatus.size() != entry_count) {
@@ -225,6 +226,8 @@ ObjectStorageIoResults KvClientObjectStorageAdapter::DeleteBatch(
     kv::TaskId task_id = kv::kInvalidTaskId;
     const auto submit = kv_client_->DeleteAsync(cache_keys, task_id);
     if (!submit.ok()) {
+        // Submission failed before the SDK accepted the task; propagate the
+        // overall error to every submitted entry.
         for (size_t i : indices)
             results[i] = tl::make_unexpected(ToErrorCode(submit));
         return results;

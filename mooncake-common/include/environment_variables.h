@@ -172,8 +172,6 @@ struct KvcsEnvironmentVariables {
 
 struct KvClientEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_KVCLIENT_CONFIG);
-    MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_KVCLIENT_MAX_OBJECT_BYTES);
-    MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_KVCLIENT_WAIT_TIMEOUT_MS);
 };
 
 struct OssAdapterEnvironmentVariables {
