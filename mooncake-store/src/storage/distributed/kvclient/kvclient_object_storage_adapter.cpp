@@ -62,6 +62,11 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
     if (!kv::KvClientConfig::LoadFromFile(config_.config_path, cfg).ok())
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     cfg.keyResolution = {};  // Force GENERIC.
+    // Keep single-key loads and stores on the batch protocol. The non-batch
+    // LOAD/STORE path reports only a CQE status with no per-entry result
+    // buffer, so a data path built on it cannot tell a missing object from a
+    // generic failure. This only affects LoadAsync/StoreAsync.
+    cfg.useBatchIoForSingleKey = true;
     // Init is not idempotent; the local client is only committed to the member
     // after this succeeds, so a retry starts from a fresh client.
     if (!client->Init(cfg).ok())
