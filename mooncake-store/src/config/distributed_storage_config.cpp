@@ -75,6 +75,21 @@ bool DistributedStorageConfig::Validate() const {
         }
         return ValidateEvictionSettings(*this);
     }
+    if (UsesKvClient()) {
+        if (!single_tenant) {
+            // Client::Put/BatchPut -> WriteDfsReplicas -> DfsWriteRequest ->
+            // ObjectPutRequest passes the raw user key; only the offload/read
+            // RPC paths use TenantId::MakeScopedKey. The SDK's IoOptions.kvns
+            // is not consumed in this version, so two tenants sharing a key
+            // would collide in the KV namespace.
+            LOG(ERROR) << "DistributedStorageConfig: KVClient requires "
+                          "single_tenant=true";
+            return false;
+        }
+        // KVClient has no capacity API, so eviction_check_interval is not
+        // required.
+        return true;
+    }
     if (fsdir.empty()) {
         LOG(ERROR) << "DistributedStorageConfig: fsdir is empty";
         return false;

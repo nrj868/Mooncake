@@ -232,13 +232,17 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 bool FileStorageConfig::Validate() const {
     // storage_filepath may be a comma-separated multi-disk list. ValidatePath
     // stats a single path and would reject the raw list string (stat of
-    // "/d0,/d1" is ENOENT), so validate each root on its own. Distributed
-    // storage on kvcs resolves its paths through the distributed backend, so
-    // keep skipping the local-directory checks there.
-    const bool uses_kvcs =
-        storage_backend_type == StorageBackendType::kDistributed &&
-        DistributedStorageConfig::FromEnvironment().UsesKvcs();
-    if (!uses_kvcs) {
+    // "/d0,/d1" is ENOENT), so validate each root on its own. Remote object
+    // backends resolve their paths through the distributed backend, so keep
+    // skipping the local-directory checks there.
+    bool uses_remote_object_storage = false;
+    if (storage_backend_type == StorageBackendType::kDistributed) {
+        const auto distributed_config =
+            DistributedStorageConfig::FromEnvironment();
+        uses_remote_object_storage = distributed_config.UsesKvcs() ||
+                                     distributed_config.UsesKvClient();
+    }
+    if (!uses_remote_object_storage) {
         if (TrimAsciiWhitespace(storage_filepath).empty()) {
             LOG(ERROR) << "FileStorageConfig: storage_filepath must not be "
                           "empty";

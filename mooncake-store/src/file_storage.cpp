@@ -123,7 +123,8 @@ FileStorage::FileStorage(const FileStorageConfig& config,
             std::dynamic_pointer_cast<DistributedStorageBackend>(
                 storage_backend_)) {
         config_.enable_dfs = !distributed_backend->UsesObjectStorage() ||
-                             distributed_backend->UsesKvcs();
+                             distributed_backend->UsesKvcs() ||
+                             distributed_backend->UsesKvClient();
         if (config_.enable_dfs && client_) {
             client_->SetDfsStorageBackend(distributed_backend);
         }

@@ -71,6 +71,10 @@ class DistributedStorageBackend : public StorageBackendInterface {
         return UsesObjectStorage() && distributed_config_.UsesKvcs();
     }
 
+    bool UsesKvClient() const {
+        return UsesObjectStorage() && distributed_config_.UsesKvClient();
+    }
+
     // True when reads go through a filesystem adapter that can read straight
     // into arbitrary host memory without an intermediate buffer.
     bool SupportsArbitraryHostReadBuffers() const;
