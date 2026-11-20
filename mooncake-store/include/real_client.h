@@ -1246,13 +1246,14 @@ class RealClient : public PyClient {
     // through request-scoped staging; LOCAL_DISK restores on the owner then
     // BatchTransferReadOffloadRanges; DISK BatchGets into a temp buffer then
     // scatters by src_offset.
-    // Put sessions track writable + inflight so end/revoke can seal the
-    // session and wait for outstanding range writes before finalize/free.
+    // SEALED sessions accept only a retry of end/revoke.
+    enum class PutSessionState { STARTING, OPEN, CLOSING, SEALED };
     struct PutSessionEntry {
         std::vector<Replica::Descriptor> replicas;
         uint64_t object_size{0};
         ReplicaWriteMode write_mode{ReplicaWriteMode::SINGLE_REPLICA};
-        bool writable{true};
+        PutSessionState state{PutSessionState::STARTING};
+        bool write_external{false};
         size_t inflight_transfers{0};
     };
     struct ExternalReadSource {};
@@ -1264,6 +1265,8 @@ class RealClient : public PyClient {
 
     void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
                                const std::vector<std::string> &keys);
+    std::vector<int> close_put_sessions(const std::vector<std::string> &keys,
+                                        bool commit);
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
