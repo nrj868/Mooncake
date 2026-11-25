@@ -2,21 +2,16 @@
 
 #include <array>
 #include <cstddef>
-#include <cstdint>
 #include <memory>
-#include <string_view>
 #include <utility>
 #include <vector>
 
 #include <glog/logging.h>
-#include <xxhash.h>
 
 #include "storage/distributed/kvclient/kvclient_adapter_factory.h"
 
 namespace mooncake {
 namespace {
-
-inline constexpr uint64_t kKvClientHashSeed = 5381;
 
 template <typename T>
 std::vector<tl::expected<T, ErrorCode>> Errors(size_t count, ErrorCode error) {
@@ -38,8 +33,6 @@ KvClientObjectStorageAdapter::KvClientObjectStorageAdapter(
     : config_(std::move(config)), kv_client_(std::move(client)) {}
 
 KvClientObjectStorageAdapter::~KvClientObjectStorageAdapter() {
-    // No separate Shutdown() method: stop accepting work and let the SDK drain
-    // pending tasks.
     if (kv_client_) kv_client_->Shutdown();
 }
 
@@ -55,18 +48,18 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
     }
 
     auto client = kv::CreateKvClient();
-    if (!client)
-        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    if (!client) return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
 
     kv::KvClientConfig cfg;
-    if (!kv::KvClientConfig::LoadFromFile(config_.config_path, cfg).ok())
+    // The adapter needs the generic resolver so logical keys are hashed
+    // verbatim, and the batch protocol so single-key requests carry per-entry
+    // results.
+    if (!kv::KvClientConfig::LoadFromFile(config_.config_path, cfg).ok() ||
+        cfg.keyResolution.engine != kv::InferenceEngine::GENERIC ||
+        !cfg.useBatchIoForSingleKey) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    cfg.keyResolution = {};  // Force GENERIC.
-    // Keep single-key loads and stores on the batch protocol. The non-batch
-    // LOAD/STORE path reports only a CQE status with no per-entry result
-    // buffer, so a data path built on it cannot tell a missing object from a
-    // generic failure. This only affects LoadAsync/StoreAsync.
-    cfg.useBatchIoForSingleKey = true;
+    }
+
     // Init is not idempotent; the local client is only committed to the member
     // after this succeeds, so a retry starts from a fresh client.
     if (!client->Init(cfg).ok())
@@ -78,45 +71,68 @@ tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Init() {
     return {};
 }
 
-ErrorCode KvClientObjectStorageAdapter::ToErrorCode(const kv::Status& status) {
+ErrorCode KvClientObjectStorageAdapter::ToErrorCode(const kv::Status& status,
+                                                    OpKind op) {
     using kv::StatusCode;
     switch (status.code) {
         case StatusCode::OK:
             return ErrorCode::OK;
+
         case StatusCode::TIMEOUT:
         case StatusCode::CQE_IO_TIMEOUT:
             return ErrorCode::RPC_TIMEOUT;
-        case StatusCode::IN_PROGRESS:
+
         case StatusCode::CANCELED:
-            return ErrorCode::INTERNAL_ERROR;
+            return ErrorCode::TASK_CANCELED;
 
-        // Object misses: only entry-level key-not-found is a miss.
-        case StatusCode::CQE_KEY_NOT_EXIST:
-        case StatusCode::ENTRY_KEY_NOT_FOUND:
-        case StatusCode::ENTRY_KEY_NOT_EXIST:
-            return ErrorCode::OBJECT_NOT_FOUND;
-
-        // NOT_FOUND is a routing/config/view error, not a missing object.
-        // Mapping it to OBJECT_NOT_FOUND would let PR3 delete metadata and
-        // PR2 evict live metadata on a routing failure.
+        // NOT_FOUND is a route/view error, not a missing object. Mapping it to
+        // OBJECT_NOT_FOUND would make the read path evict a live DFS replica.
         case StatusCode::NOT_FOUND:
         case StatusCode::NOT_INITIALIZED:
         case StatusCode::CONNECTION_ERROR:
-        case StatusCode::IO_ERROR:
-        case StatusCode::UNSUPPORTED:
-        // Delete entry failures use ENTRY_DELETE_FAILED; ENTRY_KEY_NOT_EXIST
-        // is produced only for QUERY.
-        case StatusCode::ENTRY_DELETE_FAILED:
+        case StatusCode::BUFFER_NOT_REGISTERED:
+        case StatusCode::CQE_WRITE_FAULT:
+        case StatusCode::CQE_UNRECOVERED_READ_ERROR:
             return ErrorCode::DFS_SERVICE_UNAVAILABLE;
 
+        case StatusCode::ENTRY_DELETE_FAILED:
+            return op == OpKind::kDelete ? ErrorCode::DFS_SERVICE_UNAVAILABLE
+                                         : ErrorCode::INTERNAL_ERROR;
+
+        case StatusCode::ENTRY_RETRY_ADVISED:
+            return (op == OpKind::kStore || op == OpKind::kLoad)
+                       ? ErrorCode::DFS_SERVICE_UNAVAILABLE
+                       : ErrorCode::INTERNAL_ERROR;
+
+        case StatusCode::ENTRY_NO_RETRY_ADVISED:
+            return ErrorCode::INTERNAL_ERROR;
+
+        // LOAD and BATCH_STORE share one decoder: a missing entry is a cache
+        // miss on read and a failed write on store.
+        case StatusCode::ENTRY_KEY_NOT_FOUND:
+        case StatusCode::ENTRY_DATA_NOT_EXIST:
+            if (op == OpKind::kLoad) return ErrorCode::OBJECT_NOT_FOUND;
+            if (op == OpKind::kStore) return ErrorCode::FILE_WRITE_FAIL;
+            return ErrorCode::INTERNAL_ERROR;
+
+        case StatusCode::CQE_KEY_NOT_EXIST:
+            if (op == OpKind::kLoad) return ErrorCode::OBJECT_NOT_FOUND;
+            return ErrorCode::INTERNAL_ERROR;
+
         case StatusCode::INVALID_ARGUMENT:
-        case StatusCode::BUFFER_NOT_REGISTERED:
-        case StatusCode::BUFFER_NOT_SUPPORTED:
             return ErrorCode::INVALID_PARAMS;
-        case StatusCode::CQE_OUT_OF_CREATE_SIZE:
+
         case StatusCode::RESOURCE_BUSY:
         case StatusCode::CQE_RESOURCE_BUSY:
+        case StatusCode::CQE_OUT_OF_CREATE_SIZE:
             return ErrorCode::NO_AVAILABLE_HANDLE;
+
+        // Remaining codes cannot be produced for these operations, or are
+        // protocol anomalies: ENTRY_KEY_EXIST/ENTRY_KEY_NOT_EXIST are consumed
+        // by Exists, IO_ERROR is the unknown-result fallback, and
+        // CQE_INTERNAL_ERROR, CQE_INVALID_COMMAND_OPCODE,
+        // CQE_INVALID_FIELD_IN_COMMAND, CQE_KEY_ALREADY_EXISTED and
+        // CQE_CHECK_RESULT_BUFFER are not valid outcomes here.
         default:
             return ErrorCode::INTERNAL_ERROR;
     }
@@ -126,124 +142,67 @@ KvClientObjectStorageAdapter::Completion
 KvClientObjectStorageAdapter::waitForCompletion(kv::TaskId task_id,
                                                 size_t entry_count) {
     kv::TaskResult result;
-    // 0 lets the SDK use its configured defaultWaitTimeoutMs; the adapter does
-    // not impose a second timeout. The SDK reports TIMEOUT via the result.
     const auto wait_status = kv_client_->Wait(task_id, 0, result);
     const auto code = wait_status.ok() ? result.status.code : wait_status.code;
     const kv::Status& task_status =
         wait_status.ok() ? result.status : wait_status;
 
     Completion completion;
-    switch (code) {
-        case kv::StatusCode::OK:
-        case kv::StatusCode::PARTIAL_FAILED:
-            // Only these task statuses carry meaningful per-entry results.
-            completion.terminal = true;
-            break;
-        case kv::StatusCode::TASK_NOT_FOUND:
-            // Wait removes the task even after a timeout, so an unknown task
-            // does not prove that its I/O has finished. Keep it non-terminal
-            // so callers retain handles and staging buffers.
-            completion.terminal = false;
+    if (code == kv::StatusCode::OK || code == kv::StatusCode::PARTIAL_FAILED) {
+        if (result.entryStatus.size() != entry_count) {
             completion.entryStatus.assign(
-                entry_count,
-                kv::Status::Error(kv::StatusCode::INTERNAL_ERROR,
-                                  "task not found"));
+                entry_count, kv::Status::Error(kv::StatusCode::INTERNAL_ERROR,
+                                               "entry count mismatch"));
             return completion;
-        case kv::StatusCode::TIMEOUT:
-        case kv::StatusCode::IN_PROGRESS:
-        case kv::StatusCode::CANCELED:
-            // The SDK may have populated entryStatus before returning the
-            // timeout, but the task is not terminal; per-entry results are not
-            // trustworthy. Fill with the task-level status and retain
-            // resources.
-            completion.terminal = false;
-            completion.entryStatus.assign(entry_count, task_status);
-            return completion;
-        default:
-            // A final task-level error. entryStatus may still hold submit-time
-            // OK values, so propagate the overall error to every entry instead
-            // of reading it.
-            completion.terminal = true;
-            completion.entryStatus.assign(entry_count, task_status);
-            return completion;
-    }
-
-    if (result.entryStatus.size() != entry_count) {
-        completion.entryStatus.assign(
-            entry_count,
-            kv::Status::Error(kv::StatusCode::INTERNAL_ERROR,
-                              "entry count mismatch"));
+        }
+        completion.entryStatus = std::move(result.entryStatus);
         return completion;
     }
-    completion.entryStatus = std::move(result.entryStatus);
-    return completion;
-}
 
-kv::BinaryKey KvClientObjectStorageAdapter::MakeCacheKey(
-    std::string_view logical_key) const {
-    uint64_t hash =
-        XXH64(logical_key.data(), logical_key.size(), kKvClientHashSeed);
-    // The protocol rejects an all-zero key; map it to the seed to keep the
-    // wire key non-zero without a second constant.
-    if (hash == 0) hash = kKvClientHashSeed;
-    kv::BinaryKey key{};
-    // Pack explicitly little-endian like the SDK's key_resolver; a memcpy of
-    // the host-order uint64_t would differ on big-endian clients.
-    for (size_t i = 0; i < sizeof(hash); ++i)
-        key[i] = static_cast<std::byte>(hash >> (8 * i));
-    return key;
+    // Wait consumes the task even on timeout, so no task-level error is
+    // retryable here; report it for every entry.
+    completion.entryStatus.assign(entry_count, task_status);
+    return completion;
 }
 
 tl::expected<void, ErrorCode> KvClientObjectStorageAdapter::Delete(
     const std::string& key) {
     std::array<std::string, 1> keys{key};
     auto results = DeleteBatch(keys);
-    return results.empty()
-               ? tl::make_unexpected(ErrorCode::INVALID_PARAMS)
-               : std::move(results.front());
+    return results.empty() ? tl::make_unexpected(ErrorCode::INVALID_PARAMS)
+                           : std::move(results.front());
 }
 
 ObjectStorageIoResults KvClientObjectStorageAdapter::DeleteBatch(
     std::span<const std::string> keys) {
     if (!initialized_ || !kv_client_) {
-        return ObjectStorageIoResults(
-            keys.size(),
-            tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        return Errors<void>(keys.size(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
-    ObjectStorageIoResults results(keys.size());
-    if (keys.empty()) return results;
+    if (keys.empty()) return {};
 
     std::vector<kv::CacheKey> cache_keys;
-    std::vector<size_t> indices;
     cache_keys.reserve(keys.size());
-    indices.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (keys[i].empty()) {
-            results[i] = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-            continue;
-        }
-        cache_keys.push_back(kv::CacheKey::FromBytes(MakeCacheKey(keys[i])));
-        indices.push_back(i);
+    for (const auto& key : keys) {
+        if (key.empty())
+            return Errors<void>(keys.size(), ErrorCode::INVALID_PARAMS);
+        cache_keys.push_back(kv::CacheKey::FromString(key));
     }
-    if (cache_keys.empty()) return results;
 
     kv::TaskId task_id = kv::kInvalidTaskId;
     const auto submit = kv_client_->DeleteAsync(cache_keys, task_id);
-    if (!submit.ok()) {
-        // Submission failed before the SDK accepted the task; propagate the
-        // overall error to every submitted entry.
-        for (size_t i : indices)
-            results[i] = tl::make_unexpected(ToErrorCode(submit));
-        return results;
-    }
+    if (!submit.ok())
+        return Errors<void>(keys.size(), ToErrorCode(submit, OpKind::kDelete));
 
     const auto completion = waitForCompletion(task_id, cache_keys.size());
-    for (size_t j = 0; j < indices.size(); ++j) {
-        results[indices[j]] = completion.entryStatus[j].ok()
-                                  ? tl::expected<void, ErrorCode>{}
-                                  : tl::make_unexpected(
-                                        ToErrorCode(completion.entryStatus[j]));
+    ObjectStorageIoResults results(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& status = completion.entryStatus[i];
+        // Deleting an absent key is success; "not exist" is the end state the
+        // caller asked for.
+        results[i] =
+            (status.ok() || status.code == kv::StatusCode::CQE_KEY_NOT_EXIST)
+                ? tl::expected<void, ErrorCode>{}
+                : tl::make_unexpected(ToErrorCode(status, OpKind::kDelete));
     }
     return results;
 }

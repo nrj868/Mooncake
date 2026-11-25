@@ -847,10 +847,11 @@ tl::expected<int, ErrorCode> MasterService::ExpandDfsShards(int shard_count) {
 void MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
     const auto dfs_config = DistributedStorageConfig::FromEnvironment();
-    // KVCS is an object-storage backend and does not use the filesystem DFS
-    // allocator, but it still enables the distributed-storage path.
-    enable_dfs_ =
-        DfsEnablementConfig::FromEnvironment().enabled || dfs_config.UsesKvcs();
+    // KVCS and KVClient are object-storage backends and do not use the
+    // filesystem DFS allocator, but they still enable the distributed-storage
+    // path.
+    enable_dfs_ = DfsEnablementConfig::FromEnvironment().enabled ||
+                  dfs_config.UsesKvcs() || dfs_config.UsesKvClient();
     if (!enable_dfs_) return;
 
     const bool recovery_enabled = enable_oplog_;
@@ -908,6 +909,24 @@ void MasterService::InitDfsAllocatorFromEnvironment(
         InitKvcsDfsEviction();
         LOG(INFO) << "KVCS distributed object storage initialized without "
                      "DFS extent allocator, config={"
+                  << dfs_config.FormatStr() << "}";
+        return;
+    }
+
+    if (dfs_config.UsesKvClient()) {
+        // KVClient has no snapshot/oplog restore path, so reject the
+        // combination at startup instead of letting a later restore fail
+        // silently.
+        if (recovery_enabled) {
+            LOG(ERROR) << "KVClient DFS cannot be enabled with snapshot or "
+                          "oplog recovery because metadata restoration is not "
+                          "supported";
+            throw std::invalid_argument(
+                "KVClient DFS is incompatible with snapshot/oplog recovery");
+        }
+        use_kvclient_ = true;
+        // Object storage: no EFC target and no watermark eviction.
+        LOG(INFO) << "KVClient distributed object storage initialized, config={"
                   << dfs_config.FormatStr() << "}";
         return;
     }
@@ -5060,7 +5079,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
     }
 
     if (config.dfs_replica_num > 0) {
-        if (use_kvcs_) {
+        if (use_kvcs_ || use_kvclient_) {
             DistributedFSDescriptor descriptor;
             descriptor.object_size = value_length;
             descriptor.aligned_size = value_length;
@@ -5219,8 +5238,9 @@ auto MasterService::PrepareWriteStart(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (config.dfs_replica_num > 0 &&
-        (!enable_dfs_ || (!use_kvcs_ && (!dfs_allocator_ ||
-                                         !dfs_allocator_->IsInitialized())))) {
+        (!enable_dfs_ ||
+         (!use_kvcs_ && !use_kvclient_ &&
+          (!dfs_allocator_ || !dfs_allocator_->IsInitialized())))) {
         LOG(ERROR) << "key=" << key
                    << ", dfs_replica_num=" << config.dfs_replica_num
                    << ", error=dfs_service_unavailable";

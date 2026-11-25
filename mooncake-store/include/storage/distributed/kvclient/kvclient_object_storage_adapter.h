@@ -2,7 +2,6 @@
 
 #include <memory>
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include "kv_client.h"
@@ -46,14 +45,14 @@ class KvClientObjectStorageAdapter final : public ObjectStorageAdapter {
     const char* GetName() const override { return kKvClientAdapterName; }
 
    private:
+    enum class OpKind { kDelete, kStore, kLoad, kExist };
+
     struct Completion {
-        bool terminal = false;
         std::vector<kv::Status> entryStatus;
     };
 
-    kv::BinaryKey MakeCacheKey(std::string_view logical_key) const;
     Completion waitForCompletion(kv::TaskId task_id, size_t entry_count);
-    static ErrorCode ToErrorCode(const kv::Status& status);
+    static ErrorCode ToErrorCode(const kv::Status& status, OpKind op);
 
     KvClientAdapterConfig config_;
     std::unique_ptr<kv::KvClient> kv_client_;
