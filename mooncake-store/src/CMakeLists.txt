@@ -491,8 +491,9 @@ add_library(
 target_include_directories(mooncake_nof_core
                            PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 target_link_libraries(
-  mooncake_nof_core PUBLIC glog::glog yalantinglibs::yalantinglibs
-                           cachelib_memory_allocator mooncake_common)
+  mooncake_nof_core
+  PUBLIC Mooncake::boost glog::glog yalantinglibs::yalantinglibs
+         cachelib_memory_allocator mooncake_common)
 
 if(USE_NOF)
   set(SPDK_INCLUDE_DIR
@@ -666,7 +667,8 @@ target_include_directories(mooncake_store_shared_objects
                            PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS})
 target_link_libraries(
   mooncake_store_shared_objects
-  PRIVATE cachelib_memory_allocator
+  PRIVATE Mooncake::boost
+          cachelib_memory_allocator
           glog::glog
           gflags::gflags
           yaml-cpp
@@ -698,6 +700,7 @@ target_link_libraries(
   mooncake_store_master_objects
   PRIVATE mooncake_store_shared_objects
           mooncake_local_ssd
+          Mooncake::boost
           cachelib_memory_allocator
           glog::glog
           gflags::gflags
@@ -747,6 +750,7 @@ target_include_directories(
 target_link_libraries(
   mooncake_store_client_objects
   PRIVATE mooncake_store_shared_objects
+          Mooncake::boost
           transfer_engine
           cachelib_memory_allocator
           glog::glog
@@ -815,6 +819,7 @@ target_include_directories(mooncake_store_master
                            PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
 target_link_libraries(
   mooncake_store_master
+  PUBLIC Mooncake::boost
   PRIVATE mooncake_local_ssd
           cachelib_memory_allocator
           ${ETCD_WRAPPER_LIB}
@@ -858,7 +863,8 @@ add_library(
 target_include_directories(mooncake_store PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
 target_link_libraries(
   mooncake_store
-  PUBLIC mooncake_local_ssd
+  PUBLIC Mooncake::boost
+         mooncake_local_ssd
          cachelib_memory_allocator
          ${ETCD_WRAPPER_LIB}
          glog::glog
