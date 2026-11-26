@@ -2067,6 +2067,7 @@ class MasterService {
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
     bool use_kvcs_{false};
+    bool use_kvclient_{false};
     std::unique_ptr<KvcsCapacityProvider> dfs_kvcs_capacity_provider_;
     std::chrono::seconds dfs_kvcs_capacity_check_interval_{5};
     bool dfs_kvcs_eviction_enabled_{false};

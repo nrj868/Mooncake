@@ -173,6 +173,10 @@ struct KvcsEnvironmentVariables {
     MC_DEFINE_ENV_VAR(uint64_t, MOONCAKE_KVCS_OPERATION_TIMEOUT_MS);
 };
 
+struct KvClientEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_KVCLIENT_CONFIG);
+};
+
 struct OssAdapterEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OSS_ENDPOINT);
     MC_DEFINE_ENV_VAR(std::string, OSS_ENDPOINT);

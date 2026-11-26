@@ -1637,9 +1637,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     const auto distributed_config = DistributedStorageConfig::FromEnvironment();
     const bool enable_kvcs = distributed_config.UsesKvcs();
-    if (enable_ssd_offload || enable_kvcs) {
+    const bool enable_kvclient = distributed_config.UsesKvClient();
+    if (enable_ssd_offload || enable_kvcs || enable_kvclient) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
-        if (enable_kvcs) {
+        if (enable_kvcs || enable_kvclient) {
             file_storage_config.storage_backend_type =
                 StorageBackendType::kDistributed;
         }

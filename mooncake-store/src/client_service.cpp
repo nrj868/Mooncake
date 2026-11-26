@@ -601,11 +601,12 @@ Client::~Client() {
 
 ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     ReplicateConfig client_cfg = config;
-    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs()) {
-        // KVCS is represented by one Mooncake DFS descriptor. The adapter
-        // independently handles target placement and provider replicas, so a
-        // Mooncake replica count greater than one must not create a policy the
-        // single target descriptor cannot satisfy.
+    if (dfs_storage_backend_ && (dfs_storage_backend_->UsesKvcs() ||
+                                 dfs_storage_backend_->UsesKvClient())) {
+        // Object-storage backends are represented by one Mooncake DFS
+        // descriptor. The adapter independently handles target placement and
+        // provider replicas, so a Mooncake replica count greater than one must
+        // not create a policy the single target descriptor cannot satisfy.
         client_cfg.dfs_replica_num = 1;
     }
     if (!host_id_.empty()) {
@@ -1683,7 +1684,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::OBJECT_NOT_FOUND) {
-            ReconcileMissingKvcsReplica(object_key, query_result, replica);
+            ReconcileMissingKvReplica(object_key, query_result, replica);
         }
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
         return tl::unexpected(err);
@@ -2008,9 +2009,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                     }
                     results[index] = tl::unexpected(dfs_results[i].error());
                     if (dfs_results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
-                        ReconcileMissingKvcsReplica(request.key,
-                                                    query_results[index],
-                                                    dfs_read_replicas[i]);
+                        ReconcileMissingKvReplica(request.key,
+                                                  query_results[index],
+                                                  dfs_read_replicas[i]);
                     }
                     continue;
                 }
@@ -3877,7 +3878,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
 }
 
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
-    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs()) {
+    if (dfs_storage_backend_ && (dfs_storage_backend_->UsesKvcs() ||
+                                 dfs_storage_backend_->UsesKvClient())) {
         auto results = BatchRemove({key}, force);
         if (results.size() != 1)
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
@@ -3902,9 +3904,10 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
 
 tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
                                                     bool force) {
-    // KVCS has no provider-side key listing or conditional bulk delete yet.
+    // Provider-owned stores have no key listing or conditional bulk delete yet.
     // Removing only Master metadata would skip provider cleanup.
-    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs())
+    if (dfs_storage_backend_ && (dfs_storage_backend_->UsesKvcs() ||
+                                 dfs_storage_backend_->UsesKvClient()))
         return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     if (hot_cache_) {
         hot_cache_->BumpCacheEpoch();
@@ -3925,7 +3928,8 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
 }
 
 tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
-    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs())
+    if (dfs_storage_backend_ && (dfs_storage_backend_->UsesKvcs() ||
+                                 dfs_storage_backend_->UsesKvClient()))
         return tl::unexpected(ErrorCode::NOT_SUPPORTED);
     if (hot_cache_) {
         hot_cache_->BumpCacheEpoch();
@@ -3960,7 +3964,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
         }
     }
 
-    if (dfs_storage_backend_ && dfs_storage_backend_->UsesKvcs() &&
+    if (dfs_storage_backend_ &&
+        (dfs_storage_backend_->UsesKvcs() ||
+         dfs_storage_backend_->UsesKvClient()) &&
         !removed_keys.empty()) {
         const auto deleted =
             dfs_storage_backend_->BatchDeleteObjects(removed_keys);
@@ -5514,15 +5520,15 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
     return ErrorCode::OK;
 }
 
-void Client::ReconcileMissingKvcsReplica(
+void Client::ReconcileMissingKvReplica(
     const std::string& key, const QueryResult& query_result,
     const Replica::Descriptor& replica_descriptor) {
-    if (!dfs_storage_backend_ || !dfs_storage_backend_->UsesKvcs() ||
+    if (!dfs_storage_backend_ || !dfs_storage_backend_->UsesObjectStorage() ||
         !replica_descriptor.is_dfs_replica()) {
         return;
     }
     if (!query_result.resolved_tenant_id.has_value()) {
-        LOG(WARNING) << "Cannot reconcile missing KVCS replica without "
+        LOG(WARNING) << "Cannot reconcile missing object replica without "
                         "resolved tenant, key="
                      << key;
         return;
@@ -5532,12 +5538,13 @@ void Client::ReconcileMissingKvcsReplica(
         key, *query_result.resolved_tenant_id, ReplicaType::DFS,
         replica_descriptor.id);
     if (!evicted) {
-        LOG(WARNING) << "Failed to reconcile missing KVCS replica, key=" << key
-                     << ", replica_id=" << replica_descriptor.id
+        LOG(WARNING) << "Failed to reconcile missing object replica, key="
+                     << key << ", replica_id=" << replica_descriptor.id
                      << ", error=" << toString(evicted.error());
     } else if (!*evicted) {
-        VLOG(1) << "KVCS replica was replaced before miss reconciliation, key="
-                << key << ", replica_id=" << replica_descriptor.id;
+        VLOG(1)
+            << "Object replica was replaced before miss reconciliation, key="
+            << key << ", replica_id=" << replica_descriptor.id;
     }
 }
 

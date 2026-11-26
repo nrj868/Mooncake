@@ -1096,7 +1096,7 @@ class Client {
     ErrorCode ReadDfsReplica(const std::string& key,
                              const Replica::Descriptor& replica_descriptor,
                              std::vector<Slice>& slices);
-    void ReconcileMissingKvcsReplica(
+    void ReconcileMissingKvReplica(
         const std::string& key, const QueryResult& query_result,
         const Replica::Descriptor& replica_descriptor);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
